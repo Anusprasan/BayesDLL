@@ -19,13 +19,13 @@ def create_backbone(args):
 
         net.readout_name = 'classifier'
 
-    elif args.backbone == 'resnet101':
+    elif args.backbone == 'resnet18':
 
         # randomly initialized network
-        net = torchvision.models.resnet101()
+        net = torchvision.models.resnet18()
 
         # replace the final readout layer
-        net.fc = nn.Linear(2048, args.num_classes)
+        net.fc = nn.Linear(512, args.num_classes)
         
         # randomly initialize readout layer
         for p in net.fc.parameters():
@@ -73,19 +73,19 @@ def load_pretrained_backbone(args, zero_head=True):
                     if False, head is random initialised
     '''
 
-    if args.backbone == 'resnet101':
+    if args.backbone == 'resnet18':
 
         # create a pretrained network
         if args.pretrained == 'IMAGENET1K_V1':
-            weights = torchvision.models.ResNet101_Weights.IMAGENET1K_V1
+            weights = torchvision.models.ResNet18_Weights.IMAGENET1K_V1
         elif args.pretrained == 'IMAGENET1K_V2':
-            weights = torchvision.models.ResNet101_Weights.IMAGENET1K_V2
+            weights = torchvision.models.ResNet18_Weights.IMAGENET1K_V2
         else:
             raise NotImplementedError
-        net = torchvision.models.resnet101(weights=weights)
+        net = torchvision.models.resnet18(weights=weights)
 
         # replace the final readout layer
-        net.fc = nn.Linear(2048, args.num_classes)
+        net.fc = nn.Linear(512, args.num_classes)
         
         if zero_head:  # zero-initialize readout layer
             for p in net.fc.parameters():
