@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
-
+import torch.distributions as td
 import calibration
 
 
@@ -42,7 +42,7 @@ class Runner:
         hparams = args.hparams
         self.model = Model(
             self.net if args.pretrained is None else self.net0,  # used as init for m (random init if not pretrained, or pretrained otherwise)
-            ND=args.ND, prior_sig=float(hparams['prior_sig']), bias=str(hparams['bias'])
+            ND=args.ND, prior_alpha=float(hparams['prior_alpha']), bias=str(hparams['bias'])
         ).to(args.device)
 
         # create optimizer
@@ -286,6 +286,7 @@ class Runner:
         targets = np.concatenate(targets, axis=0)
         logits = np.concatenate(logits, axis=0)
         logits_all = np.concatenate(logits_all, axis=0)
+   
 
         return loss/nb_samples, error/nb_samples, targets, logits, logits_all
 
@@ -311,7 +312,7 @@ class Runner:
         torch.save(
             {
                 'model': self.model.state_dict(), 
-                'prior_sig': self.model.prior_sig, 
+                'prior_alpha': self.model.prior_alpha, 
                 'optimizer': self.optimizer.state_dict(),
                 'epoch': epoch, 
             },
@@ -326,7 +327,7 @@ class Runner:
         ckpt = torch.load(ckpt_path, map_location=self.args.device)
         
         self.model.load_state_dict(ckpt['model'])
-        self.model.prior_sig = ckpt['prior_sig']
+        self.model.prior_alpha = ckpt['prior_alpha']
         self.optimizer.load_state_dict(ckpt['optimizer'])
 
         return ckpt['epoch']
@@ -340,13 +341,13 @@ class Model(nn.Module):
     Represents q(theta) = N(theta; m, Diag(v)) where v = s^2 (s = clamp(s_,min=1e-8)).
     '''
 
-    def __init__(self, net, ND, prior_sig=1.0, bias='informative'):
+    def __init__(self, net, ND, prior_alpha=1.0, bias='informative'):
 
         '''
         Args:
             net = either pretrained or random init backbone (init for m)
             ND = training data size
-            prior_sig = prior Gaussian sigma
+            prior_alpha = prior Gaussian sigma
             bias = how to treat bias parameters:
                 "informative": -- the same treatment as weights
                 "uninformative": uninformative bias prior
@@ -364,7 +365,7 @@ class Model(nn.Module):
                 param.copy_((1e-6)*torch.ones_like(param))  # small value
 
         self.ND = ND
-        self.prior_sig = prior_sig
+        self.prior_alpha = prior_alpha
         self.bias = bias
 
     
@@ -402,9 +403,9 @@ class Model(nn.Module):
         # sample theta ~ q(theta), ie, theta = m + eps*s, eps~N(0,I)
         with torch.no_grad():
             for p, p_m, p_s_ in zip(net.parameters(), self.m.parameters(), self.s_.parameters()):
-                eps = torch.randn_like(p)
-                p.copy_(p_m + p_s_.clamp(min=1e-8)*eps)
-
+                alpha = (p_s_.clamp(min=1e-8) ** 2) / self.prior_alpha
+                eps = td.dirichlet.Dirichlet(alpha).sample().to(p.device)
+                p.copy_(p_m + eps)
         # fwd pass with theta
         if eval_grad==0:
             with torch.no_grad():
@@ -427,18 +428,17 @@ class Model(nn.Module):
                 
                 # kl
                 if not ('bias' in pname and bias == 'uninformative'):
-                    d = p.numel()
-                    sig2 = self.prior_sig**2
-                    s = p_s_.clamp(min=1e-8)
-                    v = s**2
-                    loss_kl += 0.5 * ( (((p_m-p0)**2+v)/sig2).sum() - (v/sig2).log().sum() - d )
-
+                    alpha = (p_s_.clamp(min=1e-8) ** 2) / self.prior_alpha
+                    dirichlet_prior = td.dirichlet.Dirichlet(torch.ones_like(alpha) * self.prior_alpha)
+                    dirichlet_posterior = td.dirichlet.Dirichlet(alpha)
+                    kl_div = torch.distributions.kl.kl_divergence(dirichlet_posterior, dirichlet_prior).sum()
+                    loss_kl += kl_div
                 # gradients
                 if eval_grad and p.grad is not None:
                     if not ('bias' in pname and bias == 'uninformative'):
-                        p_m.grad = p.grad + kld*(p_m-p0)/sig2/self.ND
-                        p_s_.grad = p.grad*((p-p_m)/s) + kld*(s/sig2-1/s)/self.ND
-
+                        p_m.grad = p.grad + kld * (p_m - p0) / self.prior_alpha / self.ND
+                        p_s_.grad = p.grad * ((p - p_m) / alpha) + kld * ((alpha - 1) / alpha) / self.ND
+                        
         loss = loss_nll + kld*loss_kl/self.ND
 
         return loss.item(), out.detach(), loss_nll.item(), loss_kl.item()
